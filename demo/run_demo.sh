@@ -8,8 +8,11 @@
 #   C. 进程被 kill -9 后重启，迁移自动续办，无半迁移
 #   D. 一次修改两项的原子性（约束失败整体回滚）
 #   E. 切换中进程退出（持锁 3s 后回滚）：旧接口继续可用，可重新切换
+#   E2. 进程被 kill -9 后重启，迁移自动续办，无半迁移
+#   E3. 最终切换前作废样本归档：缺 id 整单失败、成功留存原值并两表移除、
+#       同单号重试幂等、复用 id 的新样本不被误删、按单号查询留存值
 #   F. 最终切换：samples 变同名视图，SELECT/增改删 全部保留，
-#      新旧入口读写同一份数据，每样本恰两项
+#      新旧入口读写同一份数据，每样本恰两项；归档留存切换后仍可查
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000}"
@@ -143,6 +146,55 @@ echo "  重新启动 API 进程……"
 for i in $(seq 1 20); do curl -sf "$BASE_URL/health" >/dev/null 2>&1 && break; sleep 0.5; done
 wait_phase ready 30
 ok "重启后自动续办至 ready（水位从断点继续，无重扫/丢失）"
+
+step "E3. 最终切换前：作废样本归档（原值留存 · 整单原子 · 同号幂等）"
+[ "$(phase)" = "ready" ] && ok "当前阶段 ready，可受理作废单"
+# 取归档前 id=6、8 的原值（这两个 id 未被前面的演示改动）
+BEFORE6=$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=6;")
+BEFORE8=$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=8;")
+say "归档前在线原值：id6=$BEFORE6  id8=$BEFORE8"
+
+# 整单失败：含一个不存在的 id -> 404，在线库与归档表都零变化
+CODE=$(curl -s -o /tmp/arch_bad.json -w '%{http_code}' -X POST "$BASE_URL/archive/orders" \
+       -H 'Content-Type: application/json' \
+       -d '{"order_no":"VOID-DEMO-BAD","sample_ids":[6,99999]}')
+[ "$CODE" = "404" ] && ok "含不存在 id(99999) 的作废单返回 404，整单失败"
+[ "$($PSQL -c "SELECT count(*) FROM archive_orders;")" = "0" ] && ok "失败单未在归档表留下任何残留"
+[ "$($PSQL -c "SELECT count(*) FROM samples WHERE id=6;")" = "1" ] && ok "失败单未触碰在线样本 id6"
+
+# 成功归档 id=6、8：单事务留存原值并从在线两表移除
+curl -s -X POST "$BASE_URL/archive/orders" -H 'Content-Type: application/json' \
+     -d '{"order_no":"VOID-DEMO-001","sample_ids":[6,8]}' > /tmp/arch_ok.json
+cat /tmp/arch_ok.json | python3 -m json.tool
+[ "$(cat /tmp/arch_ok.json | jget "d['status']")" = "archived" ] && ok "作废单 VOID-DEMO-001 已归档"
+[ "$(cat /tmp/arch_ok.json | jget "d['sample_count']")" = "2" ] && ok "整单留存 2 个样本"
+GOT6=$($PSQL -c "SELECT temp||'/'||ph FROM archive_samples WHERE order_no='VOID-DEMO-001' AND sample_id=6;")
+GOT8=$($PSQL -c "SELECT temp||'/'||ph FROM archive_samples WHERE order_no='VOID-DEMO-001' AND sample_id=8;")
+[ "$GOT6" = "$BEFORE6" ] && [ "$GOT8" = "$BEFORE8" ] \
+  && ok "留存原值与删除前在线值逐值一致（id6=$GOT6 id8=$GOT8）"
+[ "$($PSQL -c "SELECT count(*) FROM samples WHERE id IN (6,8);")" = "0" ] \
+  && ok "samples 不再出现 id6/8"
+[ "$($PSQL -c "SELECT count(*) FROM measurements WHERE sample_id IN (6,8);")" = "0" ] \
+  && ok "measurements 同步不再出现 id6/8（触发器级联清理）"
+
+# 同单号重试：返回首次结果（reused=true），不重复删除
+curl -s -X POST "$BASE_URL/archive/orders" -H 'Content-Type: application/json' \
+     -d '{"order_no":"VOID-DEMO-001","sample_ids":[6,8]}' > /tmp/arch_retry.json
+[ "$(cat /tmp/arch_retry.json | jget "d['reused']")" = "True" ] && ok "同单号重试 reused=true，回读首次结果"
+[ "$($PSQL -c "SELECT count(*) FROM archive_orders WHERE order_no='VOID-DEMO-001';")" = "1" ] \
+  && ok "归档单头仍只有一条，未重复落库"
+
+# 复用 id 安全：旧程序删除后复用 id=6 写入新样本，同号重试不得误删它
+$PSQL -c "INSERT INTO samples (id, temp, ph) OVERRIDING SYSTEM VALUE VALUES (6, 12.34, 5.67);"
+curl -s -X POST "$BASE_URL/archive/orders" -H 'Content-Type: application/json' \
+     -d '{"order_no":"VOID-DEMO-001","sample_ids":[6,8]}' > /tmp/arch_retry2.json
+[ "$(cat /tmp/arch_retry2.json | jget "d['reused']")" = "True" ] && ok "复用 id 后同号重试仍只回读"
+[ "$($PSQL -c "SELECT temp||'/'||ph FROM samples WHERE id=6;")" = "12.34/5.67" ] \
+  && ok "复用 id=6 的新样本(12.34/5.67)未被误删"
+# 网页/API 按单号查看留存值
+N=$(curl -s "$BASE_URL/archive/orders/VOID-DEMO-001" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['samples']))")
+[ "$N" = "2" ] && ok "GET /archive/orders/VOID-DEMO-001 可查看 2 条留存原值"
+curl -s "$BASE_URL/migration/progress" | jget "'作废单数='+str(d['archive_order_count'])+' 已归档样本='+str(d['archived_sample_count'])"
 
 step "F. 最终切换（唯一一次允许的短暂写阻塞）"
 curl -s -X POST "$BASE_URL/migration/switch" | jget "d['detail']"

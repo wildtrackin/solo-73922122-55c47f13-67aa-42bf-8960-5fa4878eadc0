@@ -5,9 +5,9 @@ from fastapi.responses import FileResponse
 from psycopg.errors import CheckViolation, UniqueViolation
 from psycopg.rows import dict_row
 
-from . import crud, db, migration
+from . import archive, crud, db, migration
 from .db import lifespan
-from .schemas import SampleIn
+from .schemas import ArchiveOrderIn, SampleIn
 
 app = FastAPI(
     title="宽表 -> 指标长表在线迁移控制台",
@@ -141,6 +141,33 @@ def measurement_group_delete(sample_id: int):
     if not ok:
         raise HTTPException(404, "measurement group not found")
     return {"ok": True, "deleted": sample_id}
+
+
+# ------------------------------------------------ 作废样本归档（切换前）
+@app.post("/archive/orders", status_code=201)
+def archive_order_submit(body: ArchiveOrderIn):
+    """提交作废单：仅 ready 阶段执行，整单原子成功或一起回滚。
+
+    同单号重试返回首次结果（reused=true），不重复删除、不误伤复用 id 的新样本。
+    """
+    with db.pool.connection() as conn:
+        return archive.archive_order(conn, body.order_no, body.sample_ids)
+
+
+@app.get("/archive/orders")
+def archive_orders_list():
+    with db.pool.connection() as conn:
+        return archive.list_orders(conn)
+
+
+@app.get("/archive/orders/{order_no}")
+def archive_order_get(order_no: str):
+    """按单号查看留存的 temp/ph 原值。"""
+    with db.pool.connection() as conn:
+        order = archive.get_order(conn, order_no)
+    if order is None:
+        raise HTTPException(404, "archive order not found")
+    return order
 
 
 @app.get("/health")

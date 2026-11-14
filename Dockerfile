@@ -8,7 +8,7 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# app 运行时还要读取 db/migrations 下的 02/03 SQL（引导与最终切换）
+# app 运行时还要读取 db/migrations 下的 02/03/04 SQL（引导、最终切换与作废归档）
 COPY app ./app
 COPY db ./db
 

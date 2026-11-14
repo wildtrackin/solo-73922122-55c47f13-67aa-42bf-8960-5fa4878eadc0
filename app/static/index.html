@@ -25,6 +25,11 @@
   .ghost { background: #e5e7eb; color: #111827; }
   input { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 6px;
           width: 90px; font-size: 13px; }
+  input.wide { width: 260px; }
+  input.mid { width: 160px; }
+  .ok { background: #15803d; color: #fff; }
+  .tag-archived { background: #dcfce7; color: #166534; }
+  .tag-failed { background: #fee2e2; color: #991b1b; }
   .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
            font-size: 12px; font-weight: 600; }
   .phase-init, .phase-paused { background: #fef3c7; color: #92400e; }
@@ -58,6 +63,33 @@
     </p>
     <p class="muted">切换是全程唯一一次短暂阻塞写入；演示按钮会在排他锁内回滚，
        模拟进程崩溃，刷新后可看到阶段自动回到 ready，旧接口不受影响。</p>
+  </section>
+
+  <section class="card full">
+    <h2>作废样本归档（仅阶段 ready 可执行，整单原子，原值留存可查）</h2>
+    <div class="grid2">
+      <div>
+        <form onsubmit="return submitArchive(event)">
+          <p><input class="mid" name="order_no" placeholder="作废单号，如 VOID-2026-001" required></p>
+          <p><input class="wide" name="sample_ids" placeholder="样本 id，逗号分隔，如 2,5,9" required></p>
+          <button class="danger" type="submit">提交作废单（移出在线库并留存原值）</button>
+        </form>
+        <p class="muted" id="archive-summary"></p>
+      </div>
+      <div>
+        <form onsubmit="return lookupArchive(event)">
+          <input class="mid" name="lookup_no" placeholder="按作废单号查询留存值" required>
+          <button class="primary" type="submit">查询留存值</button>
+        </form>
+        <div id="archive-detail"></div>
+      </div>
+    </div>
+    <table style="margin-top:12px">
+      <thead><tr><th>作废单号</th><th>状态</th><th>样本数</th><th>说明</th><th>时间</th></tr></thead>
+      <tbody id="archive-orders"></tbody>
+    </table>
+    <p class="muted">同一单号重试只回读首次结果，不会误删此后复用该 id 的新样本；
+       任一 id 已不存在则整单失败、在线数据零变化；删除经触发器同步清理 measurements。</p>
   </section>
 
   <section class="card">
@@ -130,6 +162,45 @@ async function delSample(id) {
 function esc(s){return String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
+async function submitArchive(ev) {
+  ev.preventDefault();
+  const f = ev.target;
+  const ids = f.sample_ids.value.split(',').map(s => parseInt(s.trim(), 10))
+                                       .filter(n => Number.isInteger(n));
+  if (!ids.length) { log('请输入至少一个样本 id'); return false; }
+  try {
+    const r = await api('archive/orders', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({order_no: f.order_no.value.trim(), sample_ids: ids})});
+    log(`作废单 ${r.order_no} ${r.reused ? '重试回读（未重复删除）' : '已归档'}，` +
+        `留存 ${r.samples.length} 个样本原值`);
+    f.reset();
+  } catch (e) { log('作废失败: ' + e.message); }
+  refresh();
+  return false;
+}
+
+async function lookupArchive(ev) {
+  ev.preventDefault();
+  const no = ev.target.lookup_no.value.trim();
+  const box = document.getElementById('archive-detail');
+  try {
+    const r = await api('archive/orders/' + encodeURIComponent(no));
+    box.innerHTML =
+      `<p class="muted">单号 ${esc(r.order_no)} · 状态 ${esc(r.status)} · ` +
+      `留存 ${r.samples.length} 个样本（删除前原值）</p>` +
+      '<table><thead><tr><th>sample_id</th><th>temp 留存值</th><th>ph 留存值</th></tr></thead>' +
+      '<tbody>' + r.samples.map(s =>
+        `<tr><td>${s.sample_id}</td><td>${s.temp}</td><td>${s.ph}</td></tr>`).join('') +
+      '</tbody></table>';
+    log(`查询作废单 ${no}: ${r.samples.length} 条留存记录`);
+  } catch (e) {
+    box.innerHTML = `<p class="muted">查无此作废单：${esc(e.message)}</p>`;
+    log('查询失败: ' + e.message);
+  }
+  return false;
+}
+
 async function refresh() {
   try {
     const p = await api('migration/progress');
@@ -138,7 +209,8 @@ async function refresh() {
     badge.className = 'badge phase-' + p.state;
     document.getElementById('watermark').textContent =
       ` 水位 last_id=${p.last_id} · 宽表行=${p.sample_count} · ` +
-      `长表组=${p.measured_samples} · 长表行=${p.measurement_rows}`;
+      `长表组=${p.measured_samples} · 长表行=${p.measurement_rows} · ` +
+      `作废单=${p.archive_order_count} · 已归档样本=${p.archived_sample_count}`;
     const c = p.consistency;
     document.getElementById('consistency').textContent =
       ` 一致性校验: ${c.ok ? '通过' : '失败'} ` +
@@ -155,6 +227,17 @@ async function refresh() {
     document.getElementById('measurements').innerHTML = meas.map(m =>
       `<tr><td>${m.sample_id}</td><td>${esc(m.metric)}</td><td>${m.value}</td></tr>`
     ).join('') || '<tr><td colspan="3" class="muted">无数据</td></tr>';
+
+    const orders = await api('archive/orders');
+    document.getElementById('archive-orders').innerHTML = orders.map(o =>
+      `<tr><td>${esc(o.order_no)}</td>` +
+      `<td><span class="badge tag-${esc(o.status)}">${esc(o.status)}</span></td>` +
+      `<td>${o.sample_count}</td><td>${esc(o.detail || '')}</td>` +
+      `<td>${new Date(o.created_at).toLocaleString()}</td></tr>`
+    ).join('') || '<tr><td colspan="5" class="muted">暂无作废单</td></tr>';
+    document.getElementById('archive-summary').textContent =
+      `已提交作废单 ${orders.length} 张，累计归档样本 ` +
+      `${orders.reduce((n, o) => n + o.sample_count, 0)} 个`;
   } catch (e) { log('刷新失败: ' + e.message); }
 }
 refresh();

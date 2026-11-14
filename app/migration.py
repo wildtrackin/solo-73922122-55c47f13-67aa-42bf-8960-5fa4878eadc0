@@ -36,8 +36,16 @@ def bootstrap(conn) -> None:
         "SELECT 1 FROM information_schema.tables WHERE table_name = 'measurements'"
     ).fetchone()
     if exists is not None:
+        # 02 已执行过：04（作废归档）可能是后加的，按对象名幂等补执行
+        archived = conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'archive_orders'"
+        ).fetchone()
+        if archived is None:
+            conn.execute((SQL_DIR / "04_archive.sql").read_text(encoding="utf-8"))
+            conn.commit()
         return
     conn.execute((SQL_DIR / "02_expand.sql").read_text(encoding="utf-8"))
+    conn.execute((SQL_DIR / "04_archive.sql").read_text(encoding="utf-8"))
     conn.commit()
 
 
@@ -53,7 +61,10 @@ def get_progress(conn) -> dict:
             SELECT s.state, s.last_id, s.message, s.updated_at,
                    (SELECT count(*) FROM samples)              AS sample_count,
                    (SELECT count(*) FROM measurements)         AS measurement_rows,
-                   (SELECT count(DISTINCT sample_id) FROM measurements) AS measured_samples
+                   (SELECT count(DISTINCT sample_id) FROM measurements) AS measured_samples,
+                   (SELECT count(*) FROM archive_orders)       AS archive_order_count,
+                   (SELECT COALESCE(sum(sample_count), 0) FROM archive_orders)
+                                                                AS archived_sample_count
             FROM migration_state s WHERE s.id = 1
             """
         )
